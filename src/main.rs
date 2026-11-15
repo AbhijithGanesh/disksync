@@ -4,7 +4,7 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fs,
-    io::{self, Read},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::ExitCode,
     sync::{
@@ -231,7 +231,9 @@ fn backup(src: &Path, dst: &Path, rules: &Rules) -> Stats {
     let (tx, rx) = mpsc::sync_channel::<Job>(4096);
     let rx = Mutex::new(rx);
     let done = AtomicBool::new(false);
-    let n = threads();
+    // Small files are latency-bound (open/close, antivirus), not CPU-bound: oversubscribe.
+    // ponytail: fixed 4x; tune down if the backup disk is a slow HDD that thrashes.
+    let n = threads() * 4;
     thread::scope(|s| {
         let workers: Vec<_> = (0..n)
             .map(|_| {
@@ -244,7 +246,7 @@ fn backup(src: &Path, dst: &Path, rules: &Rules) -> Stats {
                     // Game saves are their own formats: they only get the extension filter.
                     let verdict = if game.is_some() { Ok(None) } else { safety::risk(&from) };
                     let res = match verdict {
-                        Ok(None) => sync_file(&from, &to, &st).and_then(|copied| record(&from, &to, game, copied, dst, &cache, &st)),
+                        Ok(None) => sync_file(&from, &to, &st).and_then(|(copied, sha)| record(&from, &to, game, copied, sha, dst, &cache, &st)),
                         Ok(Some(reason)) => block(&from, &to, reason, &st),
                         Err(e) => Err(e),
                     };
@@ -411,14 +413,16 @@ fn copy_tree(src: &Path, dst: &Path, game: &'static str, st: &Stats, tx: &SyncSe
     }
 }
 
-// After a file is synced: get its SHA-256 (from the cache if the backup copy is untouched since
-// it was last hashed, else by reading it) and add it to its folder's entry.
-fn record(src: &Path, dst: &Path, game: Option<&'static str>, copied: bool, root: &Path, cache: &Hashes, st: &Stats) -> io::Result<()> {
+// After a file is synced: get its SHA-256 (computed during the copy, or from the cache if the
+// backup copy is untouched since it was last hashed, else by reading it) and add it to its folder.
+#[allow(clippy::too_many_arguments)]
+fn record(src: &Path, dst: &Path, game: Option<&'static str>, copied: bool, fresh: Option<String>, root: &Path, cache: &Hashes, st: &Stats) -> io::Result<()> {
     let m = fs::metadata(dst)?;
     let mtime = m.modified()?.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     let rel = dst.strip_prefix(root).unwrap_or(dst);
-    let sha = match cache.get(rel) {
-        Some((len, t, sha)) if !copied && *len == m.len() && *t == mtime => sha.clone(),
+    let sha = match (fresh, cache.get(rel)) {
+        (Some(sha), _) => sha,
+        (None, Some((len, t, sha))) if !copied && *len == m.len() && *t == mtime => sha.clone(),
         _ => sha256(fs::File::open(dst)?)?,
     };
     let (Some(dir), Some(name)) = (dst.parent(), dst.file_name()) else { return Ok(()) };
@@ -620,28 +624,41 @@ fn compress(h: &mut [u32; 8], block: &[u8]) {
     }
 }
 
+// Files up to this size are copied through memory and hashed on the way, so the backup disk
+// isn't re-read just to hash them. Bigger ones (videos) use fs::copy and are hashed after.
+const SMALL: u64 = 64 << 20;
+
 // Incremental: a file is re-copied only when its size or mtime differs from the backup copy.
-// Returns whether it was copied.
-fn sync_file(src: &Path, dst: &Path, st: &Stats) -> io::Result<bool> {
+// Returns whether it was copied, and its SHA-256 if that was computed during the copy.
+fn sync_file(src: &Path, dst: &Path, st: &Stats) -> io::Result<(bool, Option<String>)> {
     let sm = fs::metadata(src)?;
     if let Ok(dm) = fs::metadata(dst) {
         if dm.len() == sm.len() && same_mtime(dm.modified()?, sm.modified()?) {
             st.unchanged.fetch_add(1, Relaxed);
-            return Ok(false);
+            return Ok((false, None));
         }
         fs::remove_file(dst)?;
     }
-    st.bytes.fetch_add(fs::copy(src, dst)?, Relaxed);
-    // Windows copies the read-only attribute, which would block set_modified and the next update.
-    let mut p = fs::metadata(dst)?.permissions();
-    if p.readonly() {
-        #[allow(clippy::permissions_set_readonly_false)]
-        p.set_readonly(false);
-        fs::set_permissions(dst, p)?;
-    }
+    let sha = if sm.len() <= SMALL {
+        let data = fs::read(src)?;
+        fs::File::create(dst)?.write_all(&data)?; // fresh file: no read-only attribute copied
+        st.bytes.fetch_add(data.len() as u64, Relaxed);
+        Some(sha256(&data[..])?)
+    } else {
+        st.bytes.fetch_add(fs::copy(src, dst)?, Relaxed);
+        // Windows copies the read-only attribute, which would block set_modified and the next update.
+        let mut p = fs::metadata(dst)?.permissions();
+        if p.readonly() {
+            #[allow(clippy::permissions_set_readonly_false)]
+            p.set_readonly(false);
+            fs::set_permissions(dst, p)?;
+        }
+        None
+    };
+    // Separate handle, after the data handle is closed, so the OS can't overwrite it on close.
     fs::File::options().write(true).open(dst)?.set_modified(sm.modified()?)?;
     st.copied.fetch_add(1, Relaxed);
-    Ok(true)
+    Ok((true, sha))
 }
 
 // Backup disks store mtime coarser than NTFS (exFAT: 10ms, FAT32: 2s), so exact equality
