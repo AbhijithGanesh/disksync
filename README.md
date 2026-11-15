@@ -20,3 +20,23 @@ windowsyncutility.exe C: F:     # -> F:\C\...
   are missing or changed (e.g. a failing disk).
 
 Download the exe from [Releases](../../releases), or build: `cargo build --release`.
+
+## If the PC may be infected
+
+Treat the backup as untrusted: PDFs and other "harmless" files can still carry malware, so scan
+the backup before opening anything from it on a clean machine.
+
+Better: don't boot the infected Windows at all. Boot a Linux live USB (e.g. Ubuntu) so the malware
+isn't running while you copy, mount the Windows drive **read-only**, and run the Linux build:
+
+```
+lsblk -f                                  # find the Windows NTFS partition, e.g. nvme0n1p3
+sudo mkdir -p /mnt/c
+sudo mount -o ro /dev/nvme0n1p3 /mnt/c    # read-only: nothing on C: can change
+chmod +x windowsyncutility-linux-x86_64
+sudo ./windowsyncutility-linux-x86_64 /mnt/c /media/ubuntu/BACKUPDISK   # -> BACKUPDISK/C/...
+```
+
+- BitLocker drive: unlock it first with your recovery key
+  (`sudo cryptsetup open --type bitlk /dev/nvme0n1p3 win`, then mount `/dev/mapper/win`).
+- Mount a second drive at `/mnt/d` to get a `D` folder, just like `D:` on Windows.

@@ -97,7 +97,9 @@ fn main() -> ExitCode {
     };
     let src = root(src_arg);
     // C: -> F:\C\..., D: -> F:\D\... so several source drives can share one backup disk.
-    let tag: String = src_arg.chars().filter(|c| c.is_alphanumeric()).collect();
+    // From a Linux live USB the drive is a mount point: /mnt/c -> F/C, same layout as on Windows.
+    let name = if src_arg.ends_with(':') { src_arg.as_str() } else { src.file_name().and_then(OsStr::to_str).unwrap_or("") };
+    let tag: String = name.chars().filter(|c| c.is_alphanumeric()).collect();
     let dest = root(dst_arg).join(if tag.is_empty() { "backup".into() } else { tag.to_uppercase() });
     if !src.is_dir() {
         eprintln!("source {} not found", src.display());
@@ -372,7 +374,8 @@ fn copy_tree(src: &Path, dst: &Path, game: &'static str, st: &Stats, tx: &SyncSe
         let (path, target) = (e.path(), dst.join(e.file_name()));
         match e.file_type() {
             Ok(t) if t.is_dir() => copy_tree(&path, &target, game, st, tx),
-            Ok(t) if t.is_file() => {
+            // the source PC may be infected: no executables/scripts even from save folders
+            Ok(t) if t.is_file() && !report::is_exec(&path) => {
                 let _ = tx.send((path, target, Some(game)));
             }
             _ => {} // symlinks, junctions
@@ -708,6 +711,7 @@ mod tests {
             fs::write(src.join(f), f).unwrap();
         }
         fs::create_dir_all(src.join("Users/bob/AppData/LocalLow/Kumi Souls Games/The Last Faith/empty")).unwrap();
+        fs::write(src.join("Users/bob/AppData/LocalLow/Kumi Souls Games/The Last Faith/x.exe"), "MZ").unwrap();
         fs::create_dir_all(src.join("Pics")).unwrap();
         fs::write(src.join("Pics/a.jpg"), "a").unwrap();
 
@@ -718,6 +722,7 @@ mod tests {
             assert_eq!(fs::read_to_string(dst.join(f)).unwrap(), f); // same layout, any file type
         }
         assert!(dst.join("Users/bob/AppData/LocalLow/Kumi Souls Games/The Last Faith/empty").is_dir());
+        assert!(!dst.join("Users/bob/AppData/LocalLow/Kumi Souls Games/The Last Faith/x.exe").exists());
         let x = String::from_utf8_lossy(&fs::read(dst.join("_folders.xlsx")).unwrap()).into_owned();
         assert!(x.contains("The Last Faith") && x.contains("College Kings 2") && x.contains("Onimusha: Way of the Sword"));
         // folder hash of Pics = sha256("a.jpg\t<sha of a>\n")
@@ -742,6 +747,7 @@ mod tests {
 
     #[test]
     fn drive_arg_becomes_root() {
+        assert!(report::is_exec(Path::new("x/evil.JS")) && !report::is_exec(Path::new("slot0.data")));
         assert_eq!(root("C:"), PathBuf::from("C:\\"));
         assert_eq!(root("D:\\Photos"), PathBuf::from("D:\\Photos"));
     }

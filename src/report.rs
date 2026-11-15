@@ -9,7 +9,7 @@ use std::{
 };
 
 // What counts as "executable" for the report.
-pub const EXEC: [&str; 10] = ["exe", "dll", "msi", "bat", "cmd", "ps1", "vbs", "lnk", "jar", "scr"];
+pub const EXEC: &[&str] = &["exe", "dll", "msi", "bat", "cmd", "ps1", "vbs", "js", "jse", "wsf", "hta", "lnk", "jar", "scr", "com", "pif"];
 
 pub struct Exe {
     pub path: PathBuf,
