@@ -57,6 +57,7 @@ struct Stats {
     unchanged: AtomicU64,
     dupes: AtomicU64,
     errors: AtomicU64,
+    seen: AtomicU64, // bytes of walked files handled so far (copied, unchanged, blocked, dupes)
     dir: Mutex<PathBuf>, // where the walk currently is, for progress lines
     folders: Mutex<BTreeMap<PathBuf, Folder>>, // backup dir -> what's in it, for _folders.xlsx
     blocked: Mutex<Vec<Exe>>,                  // failed safety checks, for _blocked.xlsx
@@ -85,6 +86,108 @@ impl Stats {
             self.errors.load(Relaxed)
         )
     }
+
+    // `12:34:56Z [######--------------]  30.1%  1200/4000 MB  ETA 7m12s`
+    fn progress(&self, total: u64, start: Instant) -> String {
+        let seen = self.seen.load(Relaxed).min(total);
+        let frac = if total == 0 { 1.0 } else { seen as f64 / total as f64 };
+        let fill = (frac * 20.0) as usize;
+        let eta = match start.elapsed().as_secs_f64() {
+            t if seen > 0 && t > 0.0 => {
+                hms((t * (total - seen) as f64 / seen as f64) as u64)
+            }
+            _ => "?".into(),
+        };
+        format!("{} [{}{}] {:5.1}%  {}/{} MB  ETA {eta}", clock(), "#".repeat(fill), "-".repeat(20 - fill), frac * 100.0, seen >> 20, total >> 20)
+    }
+}
+
+// Human-readable timestamp for log lines, e.g. "15 Nov 2026, 5:37:36 PM".
+fn clock() -> String {
+    clock_at(SystemTime::now())
+}
+
+fn clock_at(t: SystemTime) -> String {
+    let utc = t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()) as i64;
+    let (s, zone) = match utc_offset() {
+        Some(off) => (utc + off, ""),
+        None => (utc, " UTC"),
+    };
+    let (y, m, d, rem) = report::civil(s);
+    let mon = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][m as usize - 1];
+    let (h, ampm) = (rem / 3600, if rem < 12 * 3600 { "AM" } else { "PM" });
+    format!("{d} {mon} {y}, {}:{:02}:{:02} {ampm}{zone}", (h + 11) % 12 + 1, rem / 60 % 60, rem % 60)
+}
+
+// Local time's offset from UTC in seconds, from Windows' local vs UTC clock (stdlib-only FFI).
+#[cfg(windows)]
+fn utc_offset() -> Option<i64> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct SystemTime { y: u16, mo: u16, dow: u16, d: u16, h: u16, mi: u16, s: u16, ms: u16 }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetLocalTime(t: *mut SystemTime);
+        fn GetSystemTime(t: *mut SystemTime);
+    }
+    let (mut l, mut u) = (SystemTime::default(), SystemTime::default());
+    unsafe {
+        GetLocalTime(&mut l);
+        GetSystemTime(&mut u);
+    }
+    let mins = |t: &SystemTime| t.h as i64 * 60 + t.mi as i64;
+    let day = |t: &SystemTime| (t.y, t.mo, t.d);
+    let wrap = match day(&l).cmp(&day(&u)) {
+        std::cmp::Ordering::Greater => 1440,
+        std::cmp::Ordering::Less => -1440,
+        std::cmp::Ordering::Equal => 0,
+    };
+    let off = mins(&l) - mins(&u) + wrap;
+    Some((off as f64 / 15.0).round() as i64 * 15 * 60) // zones are whole quarter hours
+}
+
+// ponytail: non-Windows (dev/tests) shows UTC; read TZ if this ever runs elsewhere for real.
+#[cfg(not(windows))]
+fn utc_offset() -> Option<i64> {
+    None
+}
+
+// 7m12s, or 1h05m once it's over an hour.
+fn hms(s: u64) -> String {
+    if s >= 3600 { format!("{}h{:02}m", s / 3600, s / 60 % 60) } else { format!("{}m{:02}s", s / 60, s % 60) }
+}
+
+// Upfront ETA: time the backup disk on small files (written in parallel, like the copy) and on
+// one flushed 32 MB file, then scale to the scan's file count and bytes.
+// ponytail: ignores source read speed, antivirus and incremental skips; the live ETA corrects it.
+fn estimate(dst: &Path, files: u64, bytes: u64, n: usize) -> io::Result<Duration> {
+    let dir = dst.join("_speedtest.tmp");
+    fs::create_dir_all(&dir)?;
+    let run = || -> io::Result<Duration> {
+        const PER: usize = 20;
+        let small = vec![0u8; 64 << 10];
+        let t = Instant::now();
+        thread::scope(|s| {
+            let hs: Vec<_> = (0..n)
+                .map(|i| {
+                    let (dir, small) = (&dir, &small);
+                    s.spawn(move || (0..PER).try_for_each(|j| fs::write(dir.join(format!("{i}_{j}")), small)))
+                })
+                .collect();
+            hs.into_iter().try_for_each(|h| h.join().unwrap())
+        })?;
+        let per_file = t.elapsed().as_secs_f64() / (n * PER) as f64;
+        let big = vec![0u8; 32 << 20];
+        let t = Instant::now();
+        let mut f = fs::File::create(dir.join("big"))?;
+        f.write_all(&big)?;
+        f.sync_all()?; // past the write cache, to the disk
+        let bps = big.len() as f64 / t.elapsed().as_secs_f64().max(1e-6);
+        Ok(Duration::from_secs_f64(files as f64 * per_file + bytes as f64 / bps))
+    };
+    let res = run();
+    let _ = fs::remove_dir_all(&dir);
+    res
 }
 
 // "C:" alone means "current dir on C:" to Windows; make it the drive root.
@@ -130,7 +233,7 @@ fn main() -> ExitCode {
     rules.paths.push(dest.clone()); // never back up the backup if it lives on the source drive
 
     let st = backup(&src, &dest, &rules);
-    println!("{}", st.line());
+    println!("{} {}", clock(), st.line());
     if st.errors.load(Relaxed) > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS }
 }
 
@@ -208,7 +311,7 @@ fn skip_file(path: &Path, rules: &Rules) -> bool {
     !keep || name_hit(path.file_name().unwrap_or_default(), rules) || excluded(path, rules)
 }
 
-type Job = (PathBuf, PathBuf, Option<&'static str>); // (from, to, game)
+type Job = (PathBuf, PathBuf, Option<&'static str>, u64); // (from, to, game, bytes toward progress)
 type Sizes = HashMap<PathBuf, u64>;
 
 // Scan and file copies run on every CPU; the walk (which feeds the copiers) is one thread.
@@ -223,9 +326,9 @@ fn backup(src: &Path, dst: &Path, rules: &Rules) -> Stats {
     let rules = &rules;
     let cache = load_hashes(dst);
     eprintln!("[scan] sizing {} ...", src.display());
-    let (sizes, mut exes) = dir_sizes(src, rules);
+    let (sizes, mut exes, files) = dir_sizes(src, rules);
     let total = sizes.get(src).copied().unwrap_or(0);
-    eprintln!("[scan] {} MB to check, {} executables skipped, took {:.0?}", total >> 20, exes.len(), t.elapsed());
+    eprintln!("[scan] {files} files, {} MB to check, {} executables skipped, took {:.0?}", total >> 20, exes.len(), t.elapsed());
 
     let st = Stats::default();
     let (tx, rx) = mpsc::sync_channel::<Job>(4096);
@@ -234,12 +337,20 @@ fn backup(src: &Path, dst: &Path, rules: &Rules) -> Stats {
     // Small files are latency-bound (open/close, antivirus), not CPU-bound: oversubscribe.
     // ponytail: fixed 4x; tune down if the backup disk is a slow HDD that thrashes.
     let n = threads() * 4;
+    match estimate(dst, files, total, n) {
+        Ok(d) => {
+            let end = SystemTime::now() + d;
+            eprintln!("[estimate] ~{} if everything needs copying (first run), done ~{}", hms(d.as_secs()), clock_at(end));
+        }
+        Err(e) => eprintln!("[estimate] backup disk speed test failed: {e}"),
+    }
+    let start = Instant::now();
     thread::scope(|s| {
         let workers: Vec<_> = (0..n)
             .map(|_| {
                 s.spawn(|| loop {
                     let job = rx.lock().unwrap().recv();
-                    let Ok((from, to, game)) = job else { break };
+                    let Ok((from, to, game, size)) = job else { break };
                     // Content check on every run, also for unchanged files: a backup copy
                     // made before a check existed (or got stricter) is removed.
                     // ponytail: re-reads every PDF each run; cache verdicts by hash if too slow.
@@ -253,6 +364,7 @@ fn backup(src: &Path, dst: &Path, rules: &Rules) -> Stats {
                     if let Err(e) = res {
                         report(&from, e, &st);
                     }
+                    st.seen.fetch_add(size, Relaxed);
                 })
             })
             .collect();
@@ -262,7 +374,8 @@ fn backup(src: &Path, dst: &Path, rules: &Rules) -> Stats {
                 thread::sleep(Duration::from_millis(100));
                 ticks += 1;
                 if ticks % 50 == 0 {
-                    eprintln!("[progress] {} | {}", st.line(), st.dir.lock().unwrap().display());
+                    eprintln!("{} | {}", st.progress(total, start), st.line());
+                    eprintln!("    in {}", st.dir.lock().unwrap().display());
                 }
             }
         });
@@ -276,6 +389,7 @@ fn backup(src: &Path, dst: &Path, rules: &Rules) -> Stats {
             w.join().unwrap();
         }
         done.store(true, Relaxed);
+        eprintln!("{}", st.progress(total, start));
     });
     exes.append(&mut st.blocked.lock().unwrap());
     eprintln!("[safety] {} files blocked, see _blocked.xlsx", exes.len());
@@ -293,10 +407,10 @@ fn backup(src: &Path, dst: &Path, rules: &Rules) -> Stats {
 // the backup doesn't mirror every empty folder on the drive.
 // ponytail: so 0-byte files are never copied; fine for photos/media/docs.
 // Junctions/symlinks (e.g. "Documents and Settings") are not dirs here, so never followed.
-fn dir_sizes(root: &Path, rules: &Rules) -> (Sizes, Vec<Exe>) {
+fn dir_sizes(root: &Path, rules: &Rules) -> (Sizes, Vec<Exe>, u64) {
     // Shared stack of dirs still to read + how many are being read right now.
     let work = Mutex::new((vec![root.to_path_buf()], 0usize));
-    let (cv, own, exes) = (Condvar::new(), Mutex::new(vec![]), Mutex::new(vec![]));
+    let (cv, own, exes, files) = (Condvar::new(), Mutex::new(vec![]), Mutex::new(vec![]), AtomicU64::new(0));
     thread::scope(|s| {
         for _ in 0..threads() {
             s.spawn(|| loop {
@@ -323,6 +437,7 @@ fn dir_sizes(root: &Path, rules: &Rules) -> (Sizes, Vec<Exe>) {
                         }
                     } else if ft.is_file() && !skip_file(&path, rules) {
                         bytes += e.metadata().map_or(0, |m| m.len());
+                        files.fetch_add(1, Relaxed);
                     } else if ft.is_file() && report::is_exec(&path) {
                         if let Ok(m) = e.metadata() {
                             let reason = "executable / script".into();
@@ -350,7 +465,7 @@ fn dir_sizes(root: &Path, rules: &Rules) -> (Sizes, Vec<Exe>) {
         }
         sizes.insert(p, total);
     }
-    (sizes, exes.into_inner().unwrap())
+    (sizes, exes.into_inner().unwrap(), files.into_inner())
 }
 
 fn threads() -> usize {
@@ -385,10 +500,13 @@ fn walk(src: &Path, dst: &Path, rules: &Rules, sizes: &Sizes, st: &Stats, tx: &S
     let dupes = skip_duplicates(&entries, dst, st);
     for entry in entries {
         let target = dst.join(entry.file_name());
+        let size = entry.metadata().map_or(0, |m| m.len());
         if entry.file_type().is_ok_and(|t| t.is_dir()) {
             walk(&entry.path(), &target, rules, sizes, st, tx);
-        } else if !dupes.contains(&entry.file_name()) {
-            let _ = tx.send((entry.path(), target, None)); // dst dir already exists
+        } else if dupes.contains(&entry.file_name()) {
+            st.seen.fetch_add(size, Relaxed);
+        } else {
+            let _ = tx.send((entry.path(), target, None, size)); // dst dir already exists
         }
     }
 }
@@ -406,7 +524,7 @@ fn copy_tree(src: &Path, dst: &Path, game: &'static str, st: &Stats, tx: &SyncSe
             Ok(t) if t.is_dir() => copy_tree(&path, &target, game, st, tx),
             // the source PC may be infected: no executables/scripts even from save folders
             Ok(t) if t.is_file() && !report::is_exec(&path) => {
-                let _ = tx.send((path, target, Some(game)));
+                let _ = tx.send((path, target, Some(game), 0)); // not in the scan total
             }
             _ => {} // symlinks, junctions
         }
@@ -805,6 +923,25 @@ mod tests {
         assert_eq!(verify(&dst), 1);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn progress_bar() {
+        let st = Stats::default();
+        st.seen.store(50 << 20, Relaxed);
+        let p = st.progress(100 << 20, Instant::now() - Duration::from_secs(60));
+        assert!(p.contains("[##########----------]  50.0%  50/100 MB  ETA 1m00s"), "{p}");
+        assert!(Stats::default().progress(0, Instant::now()).contains("100.0%"));
+        assert_eq!((hms(59), hms(3900)), ("0m59s".into(), "1h05m".into()));
+        if utc_offset().is_none() {
+            assert_eq!(clock_at(UNIX_EPOCH + Duration::from_secs(1_709_210_096)), "29 Feb 2024, 12:34:56 PM UTC");
+            assert_eq!(clock_at(UNIX_EPOCH), "1 Jan 1970, 12:00:00 AM UTC");
+        }
+        let d = env::temp_dir().join(format!("winsync-est-{}", std::process::id()));
+        fs::create_dir_all(&d).unwrap();
+        assert!(estimate(&d, 1000, 1 << 30, 2).unwrap() > Duration::ZERO);
+        assert_eq!(fs::read_dir(&d).unwrap().count(), 0, "speed test cleans up");
+        fs::remove_dir_all(d).unwrap();
     }
 
     #[test]

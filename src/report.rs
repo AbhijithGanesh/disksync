@@ -48,17 +48,21 @@ fn ext(p: &Path) -> String {
     p.extension().unwrap_or_default().to_string_lossy().to_lowercase()
 }
 
-// UTC "YYYY-MM-DD HH:MM" (Hinnant's civil_from_days). ponytail: UTC, local time needs an OS API.
+// UTC "YYYY-MM-DD HH:MM". ponytail: UTC, local time needs an OS API.
 fn date(t: SystemTime) -> String {
-    let s = t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()) as i64;
+    let (y, m, d, rem) = civil(t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()) as i64);
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", rem / 3600, rem % 3600 / 60)
+}
+
+// Unix seconds -> (year, month, day, seconds into the day). Hinnant's civil_from_days.
+pub fn civil(s: i64) -> (i64, i64, i64, i64) {
     let (z, rem) = (s.div_euclid(86400) + 719468, s.rem_euclid(86400));
     let (era, doe) = (z.div_euclid(146097), z.rem_euclid(146097));
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
     let (d, m) = (doy - (153 * mp + 2) / 5 + 1, if mp < 10 { mp + 3 } else { mp - 9 });
-    let y = yoe + era * 400 + (m <= 2) as i64;
-    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", rem / 3600, rem % 3600 / 60)
+    (yoe + era * 400 + (m <= 2) as i64, m, d, rem)
 }
 
 fn xml_esc(s: &str) -> String {

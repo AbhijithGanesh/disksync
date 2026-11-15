@@ -10,6 +10,8 @@ windowsyncutility.exe C: H:\C_Backup   # -> H:\C_Backup\... (a folder is used as
 ```
 
 - Only new/changed files are copied; deletions are never propagated.
+- After the scan it prints a rough total ETA (from a quick backup-disk speed test), then a
+  progress bar with live ETA every 5 s, timestamped in local time.
 - Identical files in one folder are copied once (`_duplicates.log`).
 - Every file's contents are checked before copying (fail closed). Blocked, with the reason, in
   `_blocked.xlsx` / `_blocked.pdf`:
