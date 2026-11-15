@@ -6,6 +6,7 @@ macro Office files, AppData or browser profiles (see `ignore.txt`).
 
 ```
 windowsyncutility.exe C: F:     # -> F:\C\...
+windowsyncutility.exe C: H:\C_Backup   # -> H:\C_Backup\... (a folder is used as-is)
 ```
 
 - Only new/changed files are copied; deletions are never propagated.

@@ -92,20 +92,31 @@ fn root(arg: &str) -> PathBuf {
     if arg.len() == 2 && arg.ends_with(':') { PathBuf::from(format!("{arg}\\")) } else { PathBuf::from(arg) }
 }
 
+// Bare drive (F: or F:\) -> F:\C\..., so several source drives can share one backup disk.
+// A folder (H:\C_Backup) is used as-is: H:\C_Backup\Users\...
+fn dest(src_arg: &str, dst_arg: &str) -> PathBuf {
+    let d = dst_arg.trim_end_matches(['\\', '/']);
+    if d.len() != 2 || !d.ends_with(':') {
+        return PathBuf::from(dst_arg);
+    }
+    let tag: String = src_arg.chars().filter(|c| c.is_alphanumeric()).collect();
+    root(d).join(if tag.is_empty() { "backup".into() } else { tag.to_uppercase() })
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     if let [flag, dir] = &args[..] && flag == "--verify" {
         return if verify(Path::new(dir)) == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE };
     }
     let [src_arg, dst_arg] = &args[..] else {
-        eprintln!("usage: windowsyncutility <source-drive> <backup-drive>   e.g. windowsyncutility C: F:");
+        eprintln!("usage: windowsyncutility <source-drive> <backup-drive-or-folder>");
+        eprintln!("       e.g. windowsyncutility C: F:            -> F:\\C\\...");
+        eprintln!("            windowsyncutility C: H:\\C_Backup   -> H:\\C_Backup\\...");
         eprintln!("       windowsyncutility --verify <backup-folder>       e.g. windowsyncutility --verify F:\\C");
         return ExitCode::from(2);
     };
     let src = root(src_arg);
-    // C: -> F:\C\..., D: -> F:\D\... so several source drives can share one backup disk.
-    let tag: String = src_arg.chars().filter(|c| c.is_alphanumeric()).collect();
-    let dest = root(dst_arg).join(if tag.is_empty() { "backup".into() } else { tag.to_uppercase() });
+    let dest = dest(src_arg, dst_arg);
     if !src.is_dir() {
         eprintln!("source {} not found", src.display());
         return ExitCode::FAILURE;
@@ -791,5 +802,8 @@ mod tests {
         assert!(report::is_exec(Path::new("x/evil.JS")) && !report::is_exec(Path::new("slot0.data")));
         assert_eq!(root("C:"), PathBuf::from("C:\\"));
         assert_eq!(root("D:\\Photos"), PathBuf::from("D:\\Photos"));
+        assert_eq!(dest("C:", "F:"), PathBuf::from("F:\\").join("C"));
+        assert_eq!(dest("d:", "F:\\"), PathBuf::from("F:\\").join("D"));
+        assert_eq!(dest("C:", "H:\\C_Backup"), PathBuf::from("H:\\C_Backup"));
     }
 }
