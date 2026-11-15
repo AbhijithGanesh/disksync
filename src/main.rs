@@ -17,12 +17,18 @@ use std::{
 };
 
 mod report;
+mod safety;
 use report::Exe;
 
 const IGNORE: &str = include_str!("../ignore.txt");
 const GAMES: &str = include_str!("../games.txt");
-// Only these extensions are ever copied (case-insensitive).
-const KEEP: [&str; 7] = ["jpg", "jpeg", "png", "mp4", "mp3", "txt", "pdf"];
+// Only these extensions are ever copied (case-insensitive). Each has a header check in safety.rs.
+const KEEP: &[&str] = &[
+    // photos, incl. iPhone HEIC and camera RAW
+    "jpg", "jpeg", "png", "tif", "tiff", "heic", "heif", "webp", "gif", "bmp",
+    "dng", "cr2", "cr3", "nef", "arw", "orf", "rw2", "raf",
+    "mp4", "mp3", "txt", "pdf",
+];
 
 #[derive(Clone)]
 struct Rules {
@@ -53,6 +59,7 @@ struct Stats {
     errors: AtomicU64,
     dir: Mutex<PathBuf>, // where the walk currently is, for progress lines
     folders: Mutex<BTreeMap<PathBuf, Folder>>, // backup dir -> what's in it, for _folders.xlsx
+    blocked: Mutex<Vec<Exe>>,                  // failed safety checks, for _blocked.xlsx
 }
 
 #[derive(Default)]
@@ -97,9 +104,7 @@ fn main() -> ExitCode {
     };
     let src = root(src_arg);
     // C: -> F:\C\..., D: -> F:\D\... so several source drives can share one backup disk.
-    // From a Linux live USB the drive is a mount point: /mnt/c -> F/C, same layout as on Windows.
-    let name = if src_arg.ends_with(':') { src_arg.as_str() } else { src.file_name().and_then(OsStr::to_str).unwrap_or("") };
-    let tag: String = name.chars().filter(|c| c.is_alphanumeric()).collect();
+    let tag: String = src_arg.chars().filter(|c| c.is_alphanumeric()).collect();
     let dest = root(dst_arg).join(if tag.is_empty() { "backup".into() } else { tag.to_uppercase() });
     if !src.is_dir() {
         eprintln!("source {} not found", src.display());
@@ -222,9 +227,18 @@ fn backup(src: &Path, dst: &Path, rules: &Rules) -> Stats {
                 s.spawn(|| loop {
                     let job = rx.lock().unwrap().recv();
                     let Ok((from, to, game)) = job else { break };
-                    match sync_file(&from, &to, &st).and_then(|copied| record(&from, &to, game, copied, dst, &cache, &st)) {
-                        Ok(()) => {}
-                        Err(e) => report(&from, e, &st),
+                    // Content check on every run, also for unchanged files: a backup copy
+                    // made before a check existed (or got stricter) is removed.
+                    // ponytail: re-reads every PDF each run; cache verdicts by hash if too slow.
+                    // Game saves are their own formats: they only get the extension filter.
+                    let verdict = if game.is_some() { Ok(None) } else { safety::risk(&from) };
+                    let res = match verdict {
+                        Ok(None) => sync_file(&from, &to, &st).and_then(|copied| record(&from, &to, game, copied, dst, &cache, &st)),
+                        Ok(Some(reason)) => block(&from, &to, reason, &st),
+                        Err(e) => Err(e),
+                    };
+                    if let Err(e) = res {
+                        report(&from, e, &st);
                     }
                 })
             })
@@ -250,8 +264,10 @@ fn backup(src: &Path, dst: &Path, rules: &Rules) -> Stats {
         }
         done.store(true, Relaxed);
     });
+    exes.append(&mut st.blocked.lock().unwrap());
+    eprintln!("[safety] {} files blocked, see _blocked.xlsx", exes.len());
     if let Err(e) = report::write(dst, src, &mut exes) {
-        report(&dst.join("_executables.*"), e, &st);
+        report(&dst.join("_blocked.*"), e, &st);
     }
     if let Err(e) = write_folders(dst, &st) {
         report(&dst.join("_folders.xlsx"), e, &st);
@@ -296,7 +312,8 @@ fn dir_sizes(root: &Path, rules: &Rules) -> (Sizes, Vec<Exe>) {
                         bytes += e.metadata().map_or(0, |m| m.len());
                     } else if ft.is_file() && report::is_exec(&path) {
                         if let Ok(m) = e.metadata() {
-                            found.push(Exe { path, size: m.len(), modified: m.modified().unwrap_or(UNIX_EPOCH) });
+                            let reason = "executable / script".into();
+                            found.push(Exe { path, size: m.len(), modified: m.modified().unwrap_or(UNIX_EPOCH), reason });
                         }
                     }
                 }
@@ -401,6 +418,14 @@ fn record(src: &Path, dst: &Path, game: Option<&'static str>, copied: bool, root
     f.files.push((name.to_string_lossy().into_owned(), sha));
     f.bytes += m.len();
     f.copied += copied as u64;
+    Ok(())
+}
+
+fn block(src: &Path, dst: &Path, reason: String, st: &Stats) -> io::Result<()> {
+    let m = fs::metadata(src)?;
+    let removed = fs::remove_file(dst).is_ok(); // an older backup copy of it, if any
+    let reason = if removed { format!("{reason} (old backup copy deleted)") } else { reason };
+    st.blocked.lock().unwrap().push(Exe { path: src.to_path_buf(), size: m.len(), modified: m.modified()?, reason });
     Ok(())
 }
 
@@ -624,6 +649,19 @@ fn report(path: &Path, e: io::Error, st: &Stats) {
 mod tests {
     use super::*;
 
+    // Test file with a real header for its type, so it passes the safety magic-byte check.
+    fn put(p: &Path, c: &str) {
+        let ext = p.extension().unwrap_or_default().to_string_lossy().to_lowercase();
+        let magic: &[u8] = match ext.as_str() {
+            "jpg" | "jpeg" => b"\xff\xd8\xff",
+            "png" => b"\x89PNG\r\n\x1a\n",
+            "mp3" => b"ID3",
+            "pdf" => b"%PDF-1.4\n",
+            _ => b"",
+        };
+        fs::write(p, [magic, c.as_bytes()].concat()).unwrap();
+    }
+
     #[test]
     fn backs_up_wanted_types_incrementally() {
         let root = env::temp_dir().join(format!("winsync-test-{}", std::process::id()));
@@ -639,8 +677,9 @@ mod tests {
             ("Browser/User Data/t.png", "t"), ("Users/bob/AppData/Local/app.exe", "MZ"),
         ];
         for (f, c) in files {
-            fs::write(src.join(f), c).unwrap();
+            put(&src.join(f), c);
         }
+        fs::write(src.join("Pics/fake.jpg"), "MZ\x00\x00this is a program").unwrap();
 
         let n = |a: &AtomicU64| a.load(Relaxed);
         let rules = rules(&src);
@@ -657,9 +696,11 @@ mod tests {
         }
 
         // executables report: found in walked areas (even folders with nothing to copy), not in AppData
-        for f in ["_executables.xlsx", "_executables.pdf"] {
+        assert!(!dst.join("Pics/fake.jpg").exists());
+        for f in ["_blocked.xlsx", "_blocked.pdf"] {
             let r = String::from_utf8_lossy(&fs::read(dst.join(f)).unwrap()).into_owned();
             assert!(r.contains("setup.exe") && r.contains("run.bat") && !r.contains("app.exe"), "{f}");
+            assert!(r.contains("fake.jpg") && r.contains("disguised"), "{f}");
         }
 
         let st = backup(&src, &dst, &rules);
@@ -679,7 +720,7 @@ mod tests {
         let (src, dst) = (root.join("src"), root.join("dst"));
         fs::create_dir_all(src.join("sub")).unwrap();
         for (f, c) in [("x.jpg", "same"), ("z.jpg", "same"), ("y.jpg", "same"), ("w.jpg", "diff"), ("sub/x.jpg", "same")] {
-            fs::write(src.join(f), c).unwrap();
+            put(&src.join(f), c);
         }
         let abc = root.join("abc");
         fs::write(&abc, "abc").unwrap();
@@ -713,7 +754,7 @@ mod tests {
         fs::create_dir_all(src.join("Users/bob/AppData/LocalLow/Kumi Souls Games/The Last Faith/empty")).unwrap();
         fs::write(src.join("Users/bob/AppData/LocalLow/Kumi Souls Games/The Last Faith/x.exe"), "MZ").unwrap();
         fs::create_dir_all(src.join("Pics")).unwrap();
-        fs::write(src.join("Pics/a.jpg"), "a").unwrap();
+        put(&src.join("Pics/a.jpg"), "a");
 
         let n = |a: &AtomicU64| a.load(Relaxed);
         let st = backup(&src, &dst, &rules(&src));
@@ -726,7 +767,7 @@ mod tests {
         let x = String::from_utf8_lossy(&fs::read(dst.join("_folders.xlsx")).unwrap()).into_owned();
         assert!(x.contains("The Last Faith") && x.contains("College Kings 2") && x.contains("Onimusha: Way of the Sword"));
         // folder hash of Pics = sha256("a.jpg\t<sha of a>\n")
-        let line = format!("a.jpg\t{}\n", sha256("a".as_bytes()).unwrap());
+        let line = format!("a.jpg\t{}\n", sha256(fs::File::open(src.join("Pics/a.jpg")).unwrap()).unwrap());
         assert!(x.contains(&sha256(line.as_bytes()).unwrap()));
 
         assert_eq!(verify(&dst), 0);

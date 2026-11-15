@@ -1,4 +1,5 @@
-// Excel + PDF list of executables found on the source drive (they are never backed up).
+// Excel + PDF list of files that were NOT backed up: executables, plus files that failed the
+// content checks in safety.rs (disguised files, PDFs with scripts/attachments, ...).
 // Both formats are hand-written to stay stdlib-only: the .xlsx is a minimal stored (uncompressed)
 // zip of SpreadsheetML parts, the .pdf is plain Helvetica text pages.
 
@@ -15,28 +16,32 @@ pub struct Exe {
     pub path: PathBuf,
     pub size: u64,
     pub modified: SystemTime,
+    pub reason: String,
 }
 
 pub fn is_exec(p: &Path) -> bool {
     p.extension().is_some_and(|e| EXEC.iter().any(|k| e.eq_ignore_ascii_case(k)))
 }
 
-// Writes `<dir>/_executables.xlsx` and `<dir>/_executables.pdf`, overwriting the last run's.
+// Writes `<dir>/_blocked.xlsx` and `<dir>/_blocked.pdf`, overwriting the last run's.
 pub fn write(dir: &Path, src: &Path, exes: &mut [Exe]) -> io::Result<()> {
     exes.sort_by(|a, b| a.path.cmp(&b.path));
     let rows: Vec<_> = exes
         .iter()
-        .map(|e| vec![Cell::T(e.path.display().to_string()), Cell::T(ext(&e.path)), Cell::N(e.size), Cell::T(date(e.modified))])
+        .map(|e| {
+            let p = e.path.display().to_string();
+            vec![Cell::T(p), Cell::T(ext(&e.path)), Cell::T(e.reason.clone()), Cell::N(e.size), Cell::T(date(e.modified))]
+        })
         .collect();
-    let cols = [("Path", 100.0), ("Type", 8.0), ("Size (bytes)", 14.0), ("Modified (UTC)", 18.0)];
-    fs::write(dir.join("_executables.xlsx"), xlsx(&cols, &rows))?;
+    let cols = [("Path", 100.0), ("Type", 8.0), ("Why it was blocked", 45.0), ("Size (bytes)", 14.0), ("Modified (UTC)", 18.0)];
+    fs::write(dir.join("_blocked.xlsx"), xlsx(&cols, &rows))?;
     let title = format!(
-        "Executable files NOT backed up from {} - {} files - generated {} UTC",
+        "Files NOT backed up (executables / unsafe content) from {} - {} files - generated {} UTC",
         src.display(),
         exes.len(),
         date(SystemTime::now())
     );
-    fs::write(dir.join("_executables.pdf"), pdf(&title, exes))
+    fs::write(dir.join("_blocked.pdf"), pdf(&title, exes))
 }
 
 fn ext(p: &Path) -> String {
@@ -202,24 +207,25 @@ fn pdf(title: &str, exes: &[Exe]) -> Vec<u8> {
         };
         put(36, 559, 11, title);
         put(740, 559, 9, &format!("page {} / {n}", i + 1));
-        for (x, h) in [(36, "Modified (UTC)"), (116, "Size"), (176, "Type"), (206, "Path")] {
+        for (x, h) in [(36, "Modified (UTC)"), (116, "Size"), (166, "Why it was blocked"), (370, "Path")] {
             put(x, 538, 8, h);
         }
         for (j, e) in rows.iter().enumerate() {
             let y = 524 - 10 * j as u32;
             let p = e.path.display().to_string();
-            // ~125 chars fit; keep the tail, it holds the file name.
-            let p = match p.char_indices().rev().nth(121) {
-                Some((k, _)) if p.chars().count() > 125 => format!("...{}", &p[k..]),
+            // ~95 chars fit; keep the tail, it holds the file name.
+            let p = match p.char_indices().rev().nth(91) {
+                Some((k, _)) if p.chars().count() > 95 => format!("...{}", &p[k..]),
                 _ => p,
             };
+            let why: String = e.reason.chars().take(44).collect();
             put(36, y, 8, &date(e.modified));
             put(116, y, 8, &format!("{} KB", e.size.div_ceil(1024)));
-            put(176, y, 8, &ext(&e.path));
-            put(206, y, 8, &p);
+            put(166, y, 8, &why);
+            put(370, y, 8, &p);
         }
         if rows.is_empty() {
-            put(36, 524, 8, "No executable files found.");
+            put(36, 524, 8, "Nothing was blocked.");
         }
         objs.push(
             format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 842 595] /Resources << /Font << /F1 3 0 R >> >> /Contents {} 0 R >>", 5 + 2 * i)
