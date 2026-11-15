@@ -24,7 +24,12 @@ pub fn is_exec(p: &Path) -> bool {
 // Writes `<dir>/_executables.xlsx` and `<dir>/_executables.pdf`, overwriting the last run's.
 pub fn write(dir: &Path, src: &Path, exes: &mut [Exe]) -> io::Result<()> {
     exes.sort_by(|a, b| a.path.cmp(&b.path));
-    fs::write(dir.join("_executables.xlsx"), xlsx(exes))?;
+    let rows: Vec<_> = exes
+        .iter()
+        .map(|e| vec![Cell::T(e.path.display().to_string()), Cell::T(ext(&e.path)), Cell::N(e.size), Cell::T(date(e.modified))])
+        .collect();
+    let cols = [("Path", 100.0), ("Type", 8.0), ("Size (bytes)", 14.0), ("Modified (UTC)", 18.0)];
+    fs::write(dir.join("_executables.xlsx"), xlsx(&cols, &rows))?;
     let title = format!(
         "Executable files NOT backed up from {} - {} files - generated {} UTC",
         src.display(),
@@ -64,25 +69,31 @@ fn xml_esc(s: &str) -> String {
         .collect()
 }
 
-fn xlsx(exes: &[Exe]) -> Vec<u8> {
+pub enum Cell {
+    T(String),
+    N(u64),
+}
+
+// One-sheet workbook: header row (frozen) + rows. `cols` = (header, column width).
+pub fn xlsx(cols: &[(&str, f32)], rows: &[Vec<Cell>]) -> Vec<u8> {
     const NS: &str = "http://schemas.openxmlformats.org";
-    let text = |c: &str, r: usize, v: &str| format!(r#"<c r="{c}{r}" t="inlineStr"><is><t>{}</t></is></c>"#, xml_esc(v));
+    let col = |j: usize| (b'A' + j as u8) as char; // ponytail: max 26 columns
+    let cell = |j: usize, r: usize, c: &Cell| match c {
+        Cell::T(v) => format!(r#"<c r="{}{r}" t="inlineStr"><is><t>{}</t></is></c>"#, col(j), xml_esc(v)),
+        Cell::N(v) => format!(r#"<c r="{}{r}"><v>{v}</v></c>"#, col(j)),
+    };
+    let widths: String = cols.iter().enumerate().map(|(j, (_, w))| format!(r#"<col min="{0}" max="{0}" width="{w}" customWidth="1"/>"#, j + 1)).collect();
+    let header: String = cols.iter().enumerate().map(|(j, (h, _))| cell(j, 1, &Cell::T(h.to_string()))).collect();
     let mut sheet = format!(
-        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="{NS}/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><cols><col min="1" max="1" width="100" customWidth="1"/><col min="2" max="2" width="8" customWidth="1"/><col min="3" max="3" width="14" customWidth="1"/><col min="4" max="4" width="18" customWidth="1"/></cols><sheetData><row r="1">{}{}{}{}</row>"#,
-        text("A", 1, "Path"),
-        text("B", 1, "Type"),
-        text("C", 1, "Size (bytes)"),
-        text("D", 1, "Modified (UTC)")
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="{NS}/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><cols>{widths}</cols><sheetData><row r="1">{header}</row>"#
     );
-    for (i, e) in exes.iter().enumerate() {
+    for (i, row) in rows.iter().enumerate() {
         let r = i + 2;
-        sheet += &format!(
-            r#"<row r="{r}">{}{}<c r="C{r}"><v>{}</v></c>{}</row>"#,
-            text("A", r, &e.path.display().to_string()),
-            text("B", r, &ext(&e.path)),
-            e.size,
-            text("D", r, &date(e.modified))
-        );
+        sheet += &format!(r#"<row r="{r}">"#);
+        for (j, c) in row.iter().enumerate() {
+            sheet += &cell(j, r, c);
+        }
+        sheet += "</row>";
     }
     sheet += "</sheetData></worksheet>";
 

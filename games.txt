@@ -1,0 +1,22 @@
+# Game save folders: copied in full (every file type, empty folders too), ignoring KEEP and
+# ignore.txt, to the same path on the backup (C:\Users\me\... -> F:\C\Users\me\...).
+# Compiled in: edit, then rebuild.  Format:  Game name | /path from the drive root
+# `*` is a wildcard, case-insensitive; a folder that doesn't exist is just skipped.
+# Steam may live in C:\Program Files (x86)\Steam, D:\Steam, D:\Games\Steam ..., hence /*/ and /*/*/.
+
+# Onimusha: Warlords (Steam app 761600) - Steam Cloud saves
+Onimusha: Warlords | /*/userdata/*/761600
+Onimusha: Warlords | /*/*/userdata/*/761600
+# Onimusha: Way of the Sword (Steam app 2638890) - Steam\userdata\<id>\2638890\remote\win64_save
+Onimusha: Way of the Sword | /*/userdata/*/2638890
+Onimusha: Way of the Sword | /*/*/userdata/*/2638890
+# reported by one guide only; harmless if absent
+Onimusha: Way of the Sword | /Users/*/AppData/Local/Capcom/Onimusha_Way_of_the_Sword
+
+# College Kings 2 (Ren'Py): %APPDATA%\RenPy\<game id> plus a copy in <install>\game\saves
+College Kings 2 | /Users/*/AppData/Roaming/RenPy/*college*kings*2*
+College Kings 2 | /*/steamapps/common/*college*kings*2*/game/saves
+College Kings 2 | /*/*/steamapps/common/*college*kings*2*/game/saves
+
+# The Last Faith (Unity): %USERPROFILE%\AppData\LocalLow\Kumi Souls Games\The Last Faith
+The Last Faith | /Users/*/AppData/LocalLow/Kumi Souls Games/The Last Faith

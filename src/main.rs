@@ -20,11 +20,13 @@ mod report;
 use report::Exe;
 
 const IGNORE: &str = include_str!("../ignore.txt");
+const GAMES: &str = include_str!("../games.txt");
 // Only these extensions are ever copied (case-insensitive).
 const KEEP: [&str; 7] = ["jpg", "jpeg", "png", "mp4", "mp3", "txt", "pdf"];
 
+#[derive(Clone)]
 struct Rules {
-    names: Vec<String>, // lowercase, may start/end with `*`
+    names: Vec<String>, // `*` globs
     paths: Vec<PathBuf>,
 }
 
@@ -36,7 +38,7 @@ fn rules(root: &Path) -> Rules {
         }
         match l.strip_prefix('/') {
             Some(p) => r.paths.push(root.join(p)),
-            None => r.names.push(l.to_lowercase()),
+            None => r.names.push(l.to_string()),
         }
     }
     r
@@ -50,7 +52,20 @@ struct Stats {
     dupes: AtomicU64,
     errors: AtomicU64,
     dir: Mutex<PathBuf>, // where the walk currently is, for progress lines
+    folders: Mutex<BTreeMap<PathBuf, Folder>>, // backup dir -> what's in it, for _folders.xlsx
 }
+
+#[derive(Default)]
+struct Folder {
+    src: PathBuf,
+    game: Option<&'static str>,
+    files: Vec<(String, String)>, // (name, sha256)
+    bytes: u64,
+    copied: u64,
+}
+
+// (backup file path relative to the backup root) -> (size, mtime ns, sha256)
+type Hashes = HashMap<PathBuf, (u64, u128, String)>;
 
 impl Stats {
     fn line(&self) -> String {
@@ -72,8 +87,12 @@ fn root(arg: &str) -> PathBuf {
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
+    if let [flag, dir] = &args[..] && flag == "--verify" {
+        return if verify(Path::new(dir)) == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE };
+    }
     let [src_arg, dst_arg] = &args[..] else {
         eprintln!("usage: windowsyncutility <source-drive> <backup-drive>   e.g. windowsyncutility C: F:");
+        eprintln!("       windowsyncutility --verify <backup-folder>       e.g. windowsyncutility --verify F:\\C");
         return ExitCode::from(2);
     };
     let src = root(src_arg);
@@ -104,7 +123,7 @@ fn excluded(path: &Path, rules: &Rules) -> bool {
         loop {
             match (a.next(), b.next()) {
                 (None, None) => return true,
-                (Some(x), Some(y)) if x.as_os_str() == "*" || x.as_os_str().eq_ignore_ascii_case(y.as_os_str()) => {}
+                (Some(x), Some(y)) if glob(&x.as_os_str().to_string_lossy(), y.as_os_str()) => {}
                 _ => return false,
             }
         }
@@ -112,16 +131,52 @@ fn excluded(path: &Path, rules: &Rules) -> bool {
 }
 
 fn name_hit(name: &OsStr, rules: &Rules) -> bool {
-    let n = name.to_string_lossy().to_lowercase();
-    rules.names.iter().any(|p| {
-        let core = p.trim_matches('*');
-        match (p.starts_with('*'), p.len() > 1 && p.ends_with('*')) {
-            (true, true) => n.contains(core),
-            (true, false) => n.ends_with(core),
-            (false, true) => n.starts_with(core),
-            _ => n == core,
+    rules.names.iter().any(|p| glob(p, name))
+}
+
+// Case-insensitive match of one name against a pattern where `*` is any run of characters.
+fn glob(pat: &str, name: &OsStr) -> bool {
+    let (pat, n) = (pat.to_lowercase(), name.to_string_lossy().to_lowercase());
+    let parts: Vec<&str> = pat.split('*').collect();
+    let (first, last) = (parts[0], parts[parts.len() - 1]);
+    if parts.len() == 1 {
+        return n == first;
+    }
+    if n.len() < first.len() + last.len() || !n.starts_with(first) || !n.ends_with(last) {
+        return false;
+    }
+    let mut rest = &n[first.len()..n.len() - last.len()];
+    for p in &parts[1..parts.len() - 1] {
+        match rest.find(p) {
+            Some(i) => rest = &rest[i + p.len()..],
+            None => return false,
         }
-    })
+    }
+    true
+}
+
+// Existing dirs matching `/a/*/b` under root, each with its game name.
+fn game_dirs(root: &Path) -> Vec<(&'static str, PathBuf)> {
+    let mut out = vec![];
+    for l in GAMES.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        let Some((game, pat)) = l.split_once('|') else { continue };
+        let mut found = vec![root.to_path_buf()];
+        for part in pat.trim().split(['/', '\\']).filter(|p| !p.is_empty()) {
+            found = found
+                .iter()
+                .flat_map(|d| {
+                    fs::read_dir(d).into_iter().flatten().flatten().filter(|e| {
+                        e.file_type().is_ok_and(|t| t.is_dir()) && glob(part, &e.file_name())
+                    })
+                })
+                .map(|e| e.path())
+                .collect();
+        }
+        out.extend(found.into_iter().map(|p| (game.trim(), p)));
+    }
+    out.sort_by(|a, b| a.1.cmp(&b.1));
+    out.dedup_by(|a, b| a.1 == b.1);
+    out
 }
 
 fn skip_dir(path: &Path, rules: &Rules) -> bool {
@@ -135,12 +190,20 @@ fn skip_file(path: &Path, rules: &Rules) -> bool {
     !keep || name_hit(path.file_name().unwrap_or_default(), rules) || excluded(path, rules)
 }
 
-type Job = (PathBuf, PathBuf);
+type Job = (PathBuf, PathBuf, Option<&'static str>); // (from, to, game)
 type Sizes = HashMap<PathBuf, u64>;
 
 // Scan and file copies run on every CPU; the walk (which feeds the copiers) is one thread.
 fn backup(src: &Path, dst: &Path, rules: &Rules) -> Stats {
     let t = Instant::now();
+    let games = game_dirs(src);
+    for (g, d) in &games {
+        eprintln!("[game] {g}: {}", d.display());
+    }
+    let mut rules = rules.clone();
+    rules.paths.extend(games.iter().map(|g| g.1.clone())); // copied by the game pass, not the walk
+    let rules = &rules;
+    let cache = load_hashes(dst);
     eprintln!("[scan] sizing {} ...", src.display());
     let (sizes, mut exes) = dir_sizes(src, rules);
     let total = sizes.get(src).copied().unwrap_or(0);
@@ -156,9 +219,10 @@ fn backup(src: &Path, dst: &Path, rules: &Rules) -> Stats {
             .map(|_| {
                 s.spawn(|| loop {
                     let job = rx.lock().unwrap().recv();
-                    let Ok((from, to)) = job else { break };
-                    if let Err(e) = sync_file(&from, &to, &st) {
-                        report(&from, e, &st);
+                    let Ok((from, to, game)) = job else { break };
+                    match sync_file(&from, &to, &st).and_then(|copied| record(&from, &to, game, copied, dst, &cache, &st)) {
+                        Ok(()) => {}
+                        Err(e) => report(&from, e, &st),
                     }
                 })
             })
@@ -174,6 +238,10 @@ fn backup(src: &Path, dst: &Path, rules: &Rules) -> Stats {
             }
         });
         walk(src, dst, rules, &sizes, &st, &tx);
+        for (game, dir) in &games {
+            let rel = dir.strip_prefix(src).unwrap_or(dir);
+            copy_tree(dir, &dst.join(rel), game, &st, &tx);
+        }
         drop(tx); // workers exit once the queue drains
         for w in workers {
             w.join().unwrap();
@@ -182,6 +250,9 @@ fn backup(src: &Path, dst: &Path, rules: &Rules) -> Stats {
     });
     if let Err(e) = report::write(dst, src, &mut exes) {
         report(&dst.join("_executables.*"), e, &st);
+    }
+    if let Err(e) = write_folders(dst, &st) {
+        report(&dst.join("_folders.xlsx"), e, &st);
     }
     st
 }
@@ -285,9 +356,129 @@ fn walk(src: &Path, dst: &Path, rules: &Rules, sizes: &Sizes, st: &Stats, tx: &S
         if entry.file_type().is_ok_and(|t| t.is_dir()) {
             walk(&entry.path(), &target, rules, sizes, st, tx);
         } else if !dupes.contains(&entry.file_name()) {
-            let _ = tx.send((entry.path(), target)); // dst dir already exists
+            let _ = tx.send((entry.path(), target, None)); // dst dir already exists
         }
     }
+}
+
+// Game saves: everything, empty folders included, same layout as the source.
+fn copy_tree(src: &Path, dst: &Path, game: &'static str, st: &Stats, tx: &SyncSender<Job>) {
+    *st.dir.lock().unwrap() = src.to_path_buf();
+    let entries = match fs::read_dir(src).and_then(|e| fs::create_dir_all(dst).map(|_| e)) {
+        Ok(e) => e,
+        Err(e) => return report(src, e, st),
+    };
+    for e in entries.flatten() {
+        let (path, target) = (e.path(), dst.join(e.file_name()));
+        match e.file_type() {
+            Ok(t) if t.is_dir() => copy_tree(&path, &target, game, st, tx),
+            Ok(t) if t.is_file() => {
+                let _ = tx.send((path, target, Some(game)));
+            }
+            _ => {} // symlinks, junctions
+        }
+    }
+}
+
+// After a file is synced: get its SHA-256 (from the cache if the backup copy is untouched since
+// it was last hashed, else by reading it) and add it to its folder's entry.
+fn record(src: &Path, dst: &Path, game: Option<&'static str>, copied: bool, root: &Path, cache: &Hashes, st: &Stats) -> io::Result<()> {
+    let m = fs::metadata(dst)?;
+    let mtime = m.modified()?.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let rel = dst.strip_prefix(root).unwrap_or(dst);
+    let sha = match cache.get(rel) {
+        Some((len, t, sha)) if !copied && *len == m.len() && *t == mtime => sha.clone(),
+        _ => sha256(fs::File::open(dst)?)?,
+    };
+    let (Some(dir), Some(name)) = (dst.parent(), dst.file_name()) else { return Ok(()) };
+    let mut folders = st.folders.lock().unwrap();
+    let f = folders.entry(dir.to_path_buf()).or_default();
+    f.src = src.parent().unwrap_or(src).to_path_buf();
+    f.game = game;
+    f.files.push((name.to_string_lossy().into_owned(), sha));
+    f.bytes += m.len();
+    f.copied += copied as u64;
+    Ok(())
+}
+
+const HASHES: &str = "_hashes.tsv";
+
+// `_hashes.tsv` in the backup root: `relative path<TAB>size<TAB>mtime ns<TAB>sha256` per file.
+// It lets unchanged files skip re-hashing, and is what `--verify` checks against.
+fn load_hashes(root: &Path) -> Hashes {
+    let txt = fs::read_to_string(root.join(HASHES)).unwrap_or_default();
+    txt.lines()
+        .filter_map(|l| {
+            let mut c = l.split('\t');
+            let (p, len, t, sha) = (c.next()?, c.next()?.parse().ok()?, c.next()?.parse().ok()?, c.next()?);
+            Some((PathBuf::from(p), (len, t, sha.to_string())))
+        })
+        .collect()
+}
+
+// One Excel row per backup folder (files directly in it; subfolders get their own rows).
+// Folder SHA-256 = SHA-256 of the folder's `name<TAB>file sha256<LF>` lines, sorted by name:
+// any added, removed, renamed or changed file changes it.
+fn write_folders(root: &Path, st: &Stats) -> io::Result<()> {
+    let mut folders = st.folders.lock().unwrap();
+    let (mut rows, mut tsv) = (vec![], String::new());
+    for (dir, f) in folders.iter_mut() {
+        f.files.sort();
+        let mut lines = String::new();
+        for (name, sha) in &f.files {
+            lines += &format!("{name}\t{sha}\n");
+            let path = dir.join(name);
+            if let Ok(m) = fs::metadata(&path) {
+                let t = m.modified()?.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+                let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned();
+                tsv += &format!("{rel}\t{}\t{t}\t{sha}\n", m.len());
+            }
+        }
+        use report::Cell::{N, T};
+        rows.push(vec![
+            T(f.game.unwrap_or("").into()),
+            T(f.src.display().to_string()),
+            T(dir.display().to_string()),
+            N(f.files.len() as u64),
+            N(f.bytes),
+            N(f.copied),
+            T(sha256(lines.as_bytes())?),
+        ]);
+    }
+    fs::write(root.join(HASHES), tsv)?;
+    let cols = [
+        ("Game", 24.0), ("Source folder", 70.0), ("Backup folder", 70.0), ("Files", 8.0),
+        ("Size (bytes)", 16.0), ("Copied this run", 15.0), ("Folder SHA-256", 68.0),
+    ];
+    fs::write(root.join("_folders.xlsx"), report::xlsx(&cols, &rows))
+}
+
+// `--verify <backup folder>`: re-read every file listed in _hashes.tsv, on every CPU, and report
+// any that are missing or whose content no longer matches. Returns the number of problems.
+fn verify(root: &Path) -> u64 {
+    let hashes: Vec<_> = load_hashes(root).into_iter().collect();
+    if hashes.is_empty() {
+        eprintln!("no {HASHES} in {} (run a backup first)", root.display());
+        return 1;
+    }
+    let (next, bad) = (AtomicU64::new(0), AtomicU64::new(0));
+    thread::scope(|s| {
+        for _ in 0..threads() {
+            s.spawn(|| loop {
+                let Some((rel, (_, _, want))) = hashes.get(next.fetch_add(1, Relaxed) as usize) else { break };
+                let path = root.join(rel);
+                match fs::File::open(&path).and_then(sha256) {
+                    Ok(got) if got == *want => continue,
+                    Ok(_) => eprintln!("CHANGED  {}", path.display()),
+                    Err(e) => eprintln!("MISSING  {}: {e}", path.display()),
+                }
+                bad.fetch_add(1, Relaxed);
+            });
+        }
+    });
+    let bad = bad.into_inner();
+    println!("verified {} files, {bad} problems", hashes.len());
+    bad
 }
 
 // Files in one dir with identical content (same size, then same SHA-256) are copied once:
@@ -307,7 +498,7 @@ fn skip_duplicates(entries: &[fs::DirEntry], dst: &Path, st: &Stats) -> HashSet<
     }
     let mut by_sha: BTreeMap<String, Vec<OsString>> = BTreeMap::new();
     for e in by_size.into_values().filter(|g| g.len() > 1).flatten() {
-        if let Ok(h) = sha256(&e.path()) {
+        if let Ok(h) = fs::File::open(e.path()).and_then(sha256) {
             by_sha.entry(h).or_default().push(e.file_name()); // unreadable: copy worker reports it
         }
     }
@@ -340,10 +531,10 @@ const K: [u32; 64] = [
 ];
 
 // SHA-256 (FIPS 180-4), hand-rolled to stay stdlib-only.
-fn sha256(path: &Path) -> io::Result<String> {
+fn sha256(mut f: impl Read) -> io::Result<String> {
     let mut h: [u32; 8] =
         [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
-    let (mut f, mut buf, mut pending, mut len) = (fs::File::open(path)?, vec![0; 1 << 16], vec![], 0u64);
+    let (mut buf, mut pending, mut len) = (vec![0; 1 << 16], vec![], 0u64);
     loop {
         let n = match f.read(&mut buf) {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -391,12 +582,13 @@ fn compress(h: &mut [u32; 8], block: &[u8]) {
 }
 
 // Incremental: a file is re-copied only when its size or mtime differs from the backup copy.
-fn sync_file(src: &Path, dst: &Path, st: &Stats) -> io::Result<()> {
+// Returns whether it was copied.
+fn sync_file(src: &Path, dst: &Path, st: &Stats) -> io::Result<bool> {
     let sm = fs::metadata(src)?;
     if let Ok(dm) = fs::metadata(dst) {
         if dm.len() == sm.len() && same_mtime(dm.modified()?, sm.modified()?) {
             st.unchanged.fetch_add(1, Relaxed);
-            return Ok(());
+            return Ok(false);
         }
         fs::remove_file(dst)?;
     }
@@ -410,7 +602,7 @@ fn sync_file(src: &Path, dst: &Path, st: &Stats) -> io::Result<()> {
     }
     fs::File::options().write(true).open(dst)?.set_modified(sm.modified()?)?;
     st.copied.fetch_add(1, Relaxed);
-    Ok(())
+    Ok(true)
 }
 
 // Backup disks store mtime coarser than NTFS (exFAT: 10ms, FAT32: 2s), so exact equality
@@ -488,17 +680,64 @@ mod tests {
         }
         let abc = root.join("abc");
         fs::write(&abc, "abc").unwrap();
-        assert_eq!(sha256(&abc).unwrap(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(sha256(fs::File::open(&abc).unwrap()).unwrap(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
 
         let n = |a: &AtomicU64| a.load(Relaxed);
         let st = backup(&src, &dst, &rules(&root));
         assert_eq!((n(&st.copied), n(&st.dupes), n(&st.errors)), (3, 2, 0)); // x w sub/x
         assert!(!dst.join("y.jpg").exists() && !dst.join("z.jpg").exists());
-        let sha = sha256(&src.join("x.jpg")).unwrap();
+        let sha = sha256(fs::File::open(src.join("x.jpg")).unwrap()).unwrap();
         assert_eq!(fs::read_to_string(dst.join("_duplicates.log")).unwrap(), format!("x.jpg | {sha} | y.jpg, z.jpg\n"));
         assert!(!dst.join("sub/_duplicates.log").exists());
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn game_saves_hashes_and_verify() {
+        let root = env::temp_dir().join(format!("winsync-games-{}", std::process::id()));
+        let (src, dst) = (root.join("src"), root.join("dst"));
+        let saves = [
+            "Users/bob/AppData/LocalLow/Kumi Souls Games/The Last Faith/slot0.data",
+            "Users/bob/AppData/Roaming/RenPy/CollegeKings2-1622130584/persistent",
+            "Program Files (x86)/Steam/userdata/42/761600/remote/file",
+            "Games/Steam/userdata/42/2638890/remote/win64_save/data00.bin",
+        ];
+        for f in saves {
+            fs::create_dir_all(src.join(f).parent().unwrap()).unwrap();
+            fs::write(src.join(f), f).unwrap();
+        }
+        fs::create_dir_all(src.join("Users/bob/AppData/LocalLow/Kumi Souls Games/The Last Faith/empty")).unwrap();
+        fs::create_dir_all(src.join("Pics")).unwrap();
+        fs::write(src.join("Pics/a.jpg"), "a").unwrap();
+
+        let n = |a: &AtomicU64| a.load(Relaxed);
+        let st = backup(&src, &dst, &rules(&src));
+        assert_eq!((n(&st.copied), n(&st.errors)), (5, 0));
+        for f in saves {
+            assert_eq!(fs::read_to_string(dst.join(f)).unwrap(), f); // same layout, any file type
+        }
+        assert!(dst.join("Users/bob/AppData/LocalLow/Kumi Souls Games/The Last Faith/empty").is_dir());
+        let x = String::from_utf8_lossy(&fs::read(dst.join("_folders.xlsx")).unwrap()).into_owned();
+        assert!(x.contains("The Last Faith") && x.contains("College Kings 2") && x.contains("Onimusha: Way of the Sword"));
+        // folder hash of Pics = sha256("a.jpg\t<sha of a>\n")
+        let line = format!("a.jpg\t{}\n", sha256("a".as_bytes()).unwrap());
+        assert!(x.contains(&sha256(line.as_bytes()).unwrap()));
+
+        assert_eq!(verify(&dst), 0);
+        let st = backup(&src, &dst, &rules(&src)); // unchanged: hashes come from the cache
+        assert_eq!((n(&st.copied), n(&st.unchanged)), (0, 5));
+        fs::write(dst.join("Pics/a.jpg"), "X").unwrap(); // bit rot on the backup disk
+        assert_eq!(verify(&dst), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn globs() {
+        let g = |p, n: &str| glob(p, OsStr::new(n));
+        assert!(g("*college*kings*2*", "CollegeKings2-1622130584") && g("*college*kings*2*", "College Kings 2"));
+        assert!(!g("*college*kings*2*", "CollegeKings-1") && g("*.EXE", "a.exe") && g("*", "x") && !g("ab", "abc"));
     }
 
     #[test]
