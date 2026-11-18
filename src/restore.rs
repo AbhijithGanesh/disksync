@@ -14,7 +14,7 @@
 // Held files are listed in <dest>\_held\_held.xlsx/.pdf; _held\inspect.wsb opens them from the
 // backup in a throwaway Windows Sandbox (read-only, no network).
 
-use super::{clock, game_dirs, load_hashes, rules, sha256, skip_dir, skip_file, threads, HASHES};
+use super::{clock, game_dirs, hms, load_hashes, rules, sha256, skip_dir, skip_file, threads, Stats, HASHES};
 use crate::{report, safety};
 use report::Exe;
 use std::{
@@ -27,7 +27,7 @@ use std::{
         Mutex,
     },
     thread,
-    time::{Duration, UNIX_EPOCH},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 pub const QUARANTINE: &str = "_restore_quarantine";
@@ -61,21 +61,25 @@ pub fn restore(backup: &Path, dest: &Path, scan: impl Fn(&Path) -> Scan) -> io::
     let games: Vec<PathBuf> = game_dirs(backup).into_iter().map(|g| g.1).collect();
     let (mut items, mut held) = (vec![], vec![]);
     list(backup, backup, &rules(backup), &games, true, false, &mut items, &mut held);
-    eprintln!("{} [restore] {} files to check, {} held already (not something the backup copies)", clock(), items.len(), held.len());
+    let sizes: Vec<u64> = items.iter().map(|(rel, _)| fs::metadata(backup.join(rel)).map_or(0, |m| m.len())).collect();
+    let total: u64 = sizes.iter().sum();
+    eprintln!("{} [restore] {} files ({} MB) to check, {} held already (not something the backup copies)", clock(), items.len(), total >> 20, held.len());
 
     // Layers 2-4, on every CPU (I/O-bound, so oversubscribed like the backup).
     let (next, done, already) = (AtomicU64::new(0), AtomicBool::new(false), AtomicU64::new(0));
-    let (staged, held_m) = (Mutex::new(vec![]), Mutex::new(held));
+    let (staged, held_m, st, start) = (Mutex::new(vec![]), Mutex::new(held), Stats::default(), Instant::now());
     thread::scope(|s| {
         let ws: Vec<_> = (0..threads() * 2)
             .map(|_| {
                 s.spawn(|| loop {
-                    let Some((rel, game)) = items.get(next.fetch_add(1, Relaxed) as usize) else { break };
+                    let i = next.fetch_add(1, Relaxed) as usize;
+                    let Some((rel, game)) = items.get(i) else { break };
                     match stage(backup, dest, &q, rel, *game, &hashes) {
                         Ok(true) => staged.lock().unwrap().push(rel.clone()),
                         Ok(false) => _ = already.fetch_add(1, Relaxed),
                         Err(why) => held_m.lock().unwrap().push(held_entry(backup, rel, why)),
                     }
+                    st.seen.fetch_add(sizes[i], Relaxed);
                 })
             })
             .collect();
@@ -85,12 +89,14 @@ pub fn restore(backup: &Path, dest: &Path, scan: impl Fn(&Path) -> Scan) -> io::
                 thread::sleep(Duration::from_millis(100));
                 ticks += 1;
                 if ticks % 50 == 0 {
-                    eprintln!("{} [restore] checked {}/{}", clock(), next.load(Relaxed).min(items.len() as u64), items.len());
+                    let n = next.load(Relaxed).min(items.len() as u64);
+                    eprintln!("{} | checked {n}/{} files", st.progress(total, start), items.len());
                 }
             }
         });
         ws.into_iter().for_each(|w| w.join().unwrap());
         done.store(true, Relaxed);
+        eprintln!("{} | checked {} files", st.progress(total, start), items.len());
     });
     let (staged, mut held) = (staged.into_inner().unwrap(), held_m.into_inner().unwrap());
 
@@ -98,7 +104,25 @@ pub fn restore(backup: &Path, dest: &Path, scan: impl Fn(&Path) -> Scan) -> io::
     eprintln!("{} [defender] scanning {} files in {} ...", clock(), staged.len(), q.display());
     let key = |p: &str| p.replace('\\', "/").to_lowercase();
     let mut threats: HashMap<String, String> = HashMap::new();
-    let fail = match scan(&q) {
+    // Defender doesn't report progress: say it's still alive every 30 s.
+    let (scanning, t) = (AtomicBool::new(true), Instant::now());
+    let result = thread::scope(|s| {
+        s.spawn(|| {
+            let mut ticks = 0u32;
+            while scanning.load(Relaxed) {
+                thread::sleep(Duration::from_millis(100));
+                ticks += 1;
+                if ticks % 300 == 0 {
+                    eprintln!("{} [defender] still scanning... {} elapsed", clock(), hms(t.elapsed().as_secs()));
+                }
+            }
+        });
+        let r = scan(&q);
+        scanning.store(false, Relaxed);
+        r
+    });
+    eprintln!("{} [defender] scan took {}", clock(), hms(t.elapsed().as_secs()));
+    let fail = match result {
         Scan::Clean => None,
         Scan::Failed(why) => Some(format!("Defender scan failed: {why}")),
         Scan::Threats(t) => {
