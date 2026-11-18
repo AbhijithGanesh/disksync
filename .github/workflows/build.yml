@@ -19,9 +19,9 @@ jobs:
       - run: cargo build --release
       - uses: actions/upload-artifact@v5
         with:
-          name: windowsyncutility
-          path: target/release/windowsyncutility.exe
+          name: disksync
+          path: target/release/disksync.exe
       - if: startsWith(github.ref, 'refs/tags/')
-        run: gh release create ${{ github.ref_name }} target/release/windowsyncutility.exe --generate-notes
+        run: gh release create ${{ github.ref_name }} target/release/disksync.exe --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}

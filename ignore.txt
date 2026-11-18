@@ -1,4 +1,4 @@
-# Things windowsyncutility never copies. Compiled into the binary: edit, then rebuild.
+# Things disksync never copies. Compiled into the binary: edit, then rebuild.
 # Only photos (jpg png tiff heic webp gif bmp camera RAW), .mp4 .mp3 .txt .pdf are ever copied
 # (KEEP in main.rs), and only if their contents pass the checks in safety.rs; this list is on top of that.
 # Matching is case-insensitive, on file AND folder names:

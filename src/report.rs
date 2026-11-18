@@ -23,8 +23,8 @@ pub fn is_exec(p: &Path) -> bool {
     p.extension().is_some_and(|e| EXEC.iter().any(|k| e.eq_ignore_ascii_case(k)))
 }
 
-// Writes `<dir>/_blocked.xlsx` and `<dir>/_blocked.pdf`, overwriting the last run's.
-pub fn write(dir: &Path, src: &Path, exes: &mut [Exe]) -> io::Result<()> {
+// Writes `<dir>/<name>.xlsx` and `<dir>/<name>.pdf`, overwriting the last run's.
+pub fn write(dir: &Path, name: &str, what: &str, src: &Path, exes: &mut [Exe]) -> io::Result<()> {
     exes.sort_by(|a, b| a.path.cmp(&b.path));
     let rows: Vec<_> = exes
         .iter()
@@ -33,15 +33,15 @@ pub fn write(dir: &Path, src: &Path, exes: &mut [Exe]) -> io::Result<()> {
             vec![Cell::T(p), Cell::T(ext(&e.path)), Cell::T(e.reason.clone()), Cell::N(e.size), Cell::T(date(e.modified))]
         })
         .collect();
-    let cols = [("Path", 100.0), ("Type", 8.0), ("Why it was blocked", 45.0), ("Size (bytes)", 14.0), ("Modified (UTC)", 18.0)];
-    fs::write(dir.join("_blocked.xlsx"), xlsx(&cols, &rows))?;
+    let cols = [("Path", 100.0), ("Type", 8.0), ("Why", 45.0), ("Size (bytes)", 14.0), ("Modified (UTC)", 18.0)];
+    fs::write(dir.join(format!("{name}.xlsx")), xlsx(&cols, &rows))?;
     let title = format!(
-        "Files NOT backed up (executables / unsafe content) from {} - {} files - generated {} UTC",
+        "{what} from {} - {} files - generated {} UTC",
         src.display(),
         exes.len(),
         date(SystemTime::now())
     );
-    fs::write(dir.join("_blocked.pdf"), pdf(&title, exes))
+    fs::write(dir.join(format!("{name}.pdf")), pdf(&title, exes))
 }
 
 fn ext(p: &Path) -> String {
@@ -65,7 +65,7 @@ pub fn civil(s: i64) -> (i64, i64, i64, i64) {
     (yoe + era * 400 + (m <= 2) as i64, m, d, rem)
 }
 
-fn xml_esc(s: &str) -> String {
+pub fn xml_esc(s: &str) -> String {
     s.chars()
         .filter(|&c| c >= ' ' || c == '\t') // control chars are invalid XML
         .map(|c| match c {

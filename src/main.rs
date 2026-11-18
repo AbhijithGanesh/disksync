@@ -17,6 +17,7 @@ use std::{
 };
 
 mod report;
+mod restore;
 mod safety;
 use report::Exe;
 
@@ -211,11 +212,16 @@ fn main() -> ExitCode {
     if let [flag, dir] = &args[..] && flag == "--verify" {
         return if verify(Path::new(dir)) == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE };
     }
+    if args.first().is_some_and(|a| a == "--restore") && (args.len() == 3 || (args.len() == 4 && args[3] == "--writable-ok")) {
+        return restore_cmd(Path::new(&args[1]), Path::new(&args[2]), args.len() == 4);
+    }
     let [src_arg, dst_arg] = &args[..] else {
-        eprintln!("usage: windowsyncutility <source-drive> <backup-drive-or-folder>");
-        eprintln!("       e.g. windowsyncutility C: F:            -> F:\\C\\...");
-        eprintln!("            windowsyncutility C: H:\\C_Backup   -> H:\\C_Backup\\...");
-        eprintln!("       windowsyncutility --verify <backup-folder>       e.g. windowsyncutility --verify F:\\C");
+        eprintln!("usage: disksync <source-drive> <backup-drive-or-folder>");
+        eprintln!("       disksync --restore <backup-folder> <destination-folder> [--writable-ok]");
+        eprintln!("            e.g. disksync --restore F:\\C D:\\Restored");
+        eprintln!("       e.g. disksync C: F:            -> F:\\C\\...");
+        eprintln!("            disksync C: H:\\C_Backup   -> H:\\C_Backup\\...");
+        eprintln!("       disksync --verify <backup-folder>       e.g. disksync --verify F:\\C");
         return ExitCode::from(2);
     };
     let src = root(src_arg);
@@ -235,6 +241,54 @@ fn main() -> ExitCode {
     let st = backup(&src, &dest, &rules);
     println!("{} {}", clock(), st.line());
     if st.errors.load(Relaxed) > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+}
+
+fn restore_cmd(backup: &Path, dest: &Path, writable_ok: bool) -> ExitCode {
+    if !backup.join(HASHES).is_file() {
+        eprintln!("{} has no {HASHES}: point at the backup folder (e.g. F:\\C)", backup.display());
+        return ExitCode::FAILURE;
+    }
+    // Read-only so nothing on this PC (Defender included) can delete or change the originals.
+    if restore::read_only_volume(backup) != Some(true) && !writable_ok {
+        eprintln!("The backup disk is not read-only. To protect the originals, in an admin Command Prompt:");
+        eprintln!("    diskpart");
+        eprintln!("    list volume");
+        eprintln!("    select volume <number of the backup disk>");
+        eprintln!("    attributes volume set readonly");
+        eprintln!("    exit");
+        eprintln!("then unplug and replug the disk and run this again (or add --writable-ok to skip this).");
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = fs::create_dir_all(dest) {
+        eprintln!("cannot create {}: {e}", dest.display());
+        return ExitCode::FAILURE;
+    }
+    match (fs::canonicalize(backup), fs::canonicalize(dest)) {
+        (Ok(b), Ok(d)) if d.starts_with(&b) || b.starts_with(&d) => {
+            eprintln!("destination and backup must not be inside each other");
+            return ExitCode::FAILURE;
+        }
+        (Ok(_), Ok(_)) => {}
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    let out = match restore::restore(backup, dest, restore::defender) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("restore failed, nothing more released: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("{} restored {}, already there {}, held back {}", clock(), out.restored, out.already, out.held.len());
+    if out.held.is_empty() {
+        return ExitCode::SUCCESS;
+    }
+    let held = dest.join(restore::HELD);
+    println!("held files are untouched on the backup; list: {}", held.join("_held.xlsx").display());
+    restore::open_sandbox(&held.join("inspect.wsb"));
+    ExitCode::FAILURE
 }
 
 // `/` rules match a file or dir; a `*` component matches any one name. Case-insensitive like NTFS.
@@ -393,7 +447,7 @@ fn backup(src: &Path, dst: &Path, rules: &Rules) -> Stats {
     });
     exes.append(&mut st.blocked.lock().unwrap());
     eprintln!("[safety] {} files blocked, see _blocked.xlsx", exes.len());
-    if let Err(e) = report::write(dst, src, &mut exes) {
+    if let Err(e) = report::write(dst, "_blocked", "Files NOT backed up (executables / unsafe content)", src, &mut exes) {
         report(&dst.join("_blocked.*"), e, &st);
     }
     if let Err(e) = write_folders(dst, &st) {
