@@ -212,12 +212,13 @@ fn main() -> ExitCode {
     if let [flag, dir] = &args[..] && flag == "--verify" {
         return if verify(Path::new(dir)) == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE };
     }
-    if args.first().is_some_and(|a| a == "--restore") && (args.len() == 3 || (args.len() == 4 && args[3] == "--writable-ok")) {
-        return restore_cmd(Path::new(&args[1]), Path::new(&args[2]), args.len() == 4);
+    if args.first().is_some_and(|a| a == "--restore") && args.len() >= 3 && args[3..].iter().all(|a| a == "--writable-ok" || a == "--no-hashes") {
+        let has = |f: &str| args[3..].iter().any(|a| a == f);
+        return restore_cmd(Path::new(&args[1]), Path::new(&args[2]), has("--writable-ok"), has("--no-hashes"));
     }
     let [src_arg, dst_arg] = &args[..] else {
         eprintln!("usage: disksync <source-drive> <backup-drive-or-folder>");
-        eprintln!("       disksync --restore <backup-folder> <destination-folder> [--writable-ok]");
+        eprintln!("       disksync --restore <backup-folder> <destination-folder> [--writable-ok] [--no-hashes]");
         eprintln!("            e.g. disksync --restore F:\\C D:\\Restored");
         eprintln!("       e.g. disksync C: F:            -> F:\\C\\...");
         eprintln!("            disksync C: H:\\C_Backup   -> H:\\C_Backup\\...");
@@ -243,10 +244,18 @@ fn main() -> ExitCode {
     if st.errors.load(Relaxed) > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS }
 }
 
-fn restore_cmd(backup: &Path, dest: &Path, writable_ok: bool) -> ExitCode {
-    if !backup.join(HASHES).is_file() {
-        eprintln!("{} has no {HASHES}: point at the backup folder (e.g. F:\\C)", backup.display());
+fn restore_cmd(backup: &Path, dest: &Path, writable_ok: bool, no_hashes: bool) -> ExitCode {
+    if !backup.is_dir() {
+        eprintln!("{} not found", backup.display());
         return ExitCode::FAILURE;
+    }
+    if !backup.join(HASHES).is_file() {
+        if !no_hashes {
+            eprintln!("{} has no {HASHES}: point at the backup folder (e.g. F:\\C).", backup.display());
+            eprintln!("If the backup never finished, add --no-hashes to restore without the SHA-256 check.");
+            return ExitCode::FAILURE;
+        }
+        eprintln!("WARNING: no {HASHES}: files can't be checked against the backup (SHA-256 check skipped).");
     }
     // Read-only so nothing on this PC (Defender included) can delete or change the originals.
     if restore::read_only_volume(backup) != Some(true) && !writable_ok {
@@ -274,7 +283,7 @@ fn restore_cmd(backup: &Path, dest: &Path, writable_ok: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
-    let out = match restore::restore(backup, dest, restore::defender) {
+    let out = match restore::restore(backup, dest, !no_hashes, restore::defender) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("restore failed, nothing more released: {e}");

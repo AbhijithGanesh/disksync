@@ -47,11 +47,13 @@ pub struct Outcome {
     pub held: Vec<Exe>,
 }
 
-pub fn restore(backup: &Path, dest: &Path, scan: impl Fn(&Path) -> Scan) -> io::Result<Outcome> {
+// `need_hashes = false` (--no-hashes) restores a backup without a _hashes.tsv, skipping layer 3.
+pub fn restore(backup: &Path, dest: &Path, need_hashes: bool, scan: impl Fn(&Path) -> Scan) -> io::Result<Outcome> {
     let hashes = load_hashes(backup);
-    if hashes.is_empty() {
+    if hashes.is_empty() && need_hashes {
         return Err(io::Error::other(format!("no {HASHES} in {} - not a backup folder?", backup.display())));
     }
+    let hashes = (!hashes.is_empty()).then_some(hashes);
     let q = dest.join(QUARANTINE);
     let _ = fs::remove_dir_all(&q); // leftovers of an interrupted run; the originals are on the backup
     fs::create_dir_all(&q)?;
@@ -74,7 +76,7 @@ pub fn restore(backup: &Path, dest: &Path, scan: impl Fn(&Path) -> Scan) -> io::
                 s.spawn(|| loop {
                     let i = next.fetch_add(1, Relaxed) as usize;
                     let Some((rel, game)) = items.get(i) else { break };
-                    match stage(backup, dest, &q, rel, *game, &hashes) {
+                    match stage(backup, dest, &q, rel, *game, hashes.as_ref()) {
                         Ok(true) => staged.lock().unwrap().push(rel.clone()),
                         Ok(false) => _ = already.fetch_add(1, Relaxed),
                         Err(why) => held_m.lock().unwrap().push(held_entry(backup, rel, why)),
@@ -214,20 +216,26 @@ fn list(root: &Path, dir: &Path, rules: &super::Rules, games: &[PathBuf], ok: bo
 }
 
 // Layers 3 and 4 for one file. Ok(true) = in quarantine, Ok(false) = already restored, Err = held.
-fn stage(backup: &Path, dest: &Path, q: &Path, rel: &Path, game: bool, hashes: &super::Hashes) -> Result<bool, String> {
-    let Some((_, _, want)) = hashes.get(rel) else {
-        return Err(format!("not in {HASHES}: added or renamed after the backup"));
+fn stage(backup: &Path, dest: &Path, q: &Path, rel: &Path, game: bool, hashes: Option<&super::Hashes>) -> Result<bool, String> {
+    let want = match hashes.map(|h| h.get(rel)) {
+        Some(None) => return Err(format!("not in {HASHES}: added or renamed after the backup")),
+        Some(Some((_, _, sha))) => Some(sha.clone()),
+        None => None, // --no-hashes
     };
     let to = dest.join(rel);
     if to.exists() {
         let have = fs::File::open(&to).and_then(sha256).map_err(|e| format!("destination exists, can't read it: {e}"))?;
-        return if have == *want { Ok(false) } else { Err("a different file already exists at the destination (not overwritten)".into()) };
+        let want = match want {
+            Some(w) => w,
+            None => fs::File::open(backup.join(rel)).and_then(sha256).map_err(|e| format!("can't be read: {e}"))?,
+        };
+        return if have == want { Ok(false) } else { Err("a different file already exists at the destination (not overwritten)".into()) };
     }
     let qp = q.join(rel);
     let checked = (|| -> io::Result<Option<String>> {
         fs::create_dir_all(qp.parent().unwrap())?;
         let got = copy_hashed(&backup.join(rel), &qp)?;
-        if got != *want {
+        if want.is_some_and(|w| w != got) {
             return Ok(Some("content changed since the backup (SHA-256 mismatch)".into()));
         }
         // Game saves are their own formats: they only get the no-programs rule.
@@ -412,7 +420,7 @@ mod tests {
         fs::write(bk.join("Pics/run.exe"), "MZ").unwrap();
         let fake_defender = |q: &Path| Scan::Threats(vec![(q.join("Pics/b.jpg").display().to_string(), "EICAR".into())]);
 
-        let out = restore(&bk, &dest, fake_defender).unwrap();
+        let out = restore(&bk, &dest, true, fake_defender).unwrap();
         assert_eq!(out.restored, 3, "a.jpg, doc.pdf, the game save");
         assert_eq!(fs::read(dest.join("Pics/a.jpg")).unwrap(), originals[0]);
         assert_eq!(fs::read_to_string(dest.join(save)).unwrap(), "save");
@@ -430,11 +438,20 @@ mod tests {
         assert!(wsb.contains(&bk.display().to_string()) && wsb.contains("<ReadOnly>true</ReadOnly>") && wsb.contains("<Networking>Disable"));
 
         // Re-run: done files are recognised, nothing overwritten. A scan failure releases nothing.
-        let out = restore(&bk, &dest, |_: &Path| Scan::Failed("boom".into())).unwrap();
+        let out = restore(&bk, &dest, true, |_: &Path| Scan::Failed("boom".into())).unwrap();
         assert_eq!((out.restored, out.already), (0, 3));
-        let out = restore(&bk, &root.join("dest2"), |_: &Path| Scan::Failed("boom".into())).unwrap();
+        let out = restore(&bk, &root.join("dest2"), true, |_: &Path| Scan::Failed("boom".into())).unwrap();
         assert_eq!(out.restored, 0);
         assert!(fs::read_dir(root.join("dest2")).unwrap().all(|e| e.unwrap().file_name() == HELD));
+
+        // No _hashes.tsv: refused unless --no-hashes; then only the hash layer is skipped.
+        fs::remove_file(bk.join(HASHES)).unwrap();
+        assert!(restore(&bk, &root.join("dest3"), true, |_: &Path| Scan::Clean).is_err());
+        let out = restore(&bk, &root.join("dest3"), false, |_: &Path| Scan::Clean).unwrap();
+        assert_eq!(out.restored, 6, "a, b, c, new, doc.pdf, the game save");
+        assert!(!root.join("dest3/Pics/run.exe").exists());
+        let out = restore(&bk, &root.join("dest3"), false, |_: &Path| Scan::Clean).unwrap();
+        assert_eq!((out.restored, out.already), (0, 6));
 
         fs::remove_dir_all(root).unwrap();
     }

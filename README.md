@@ -67,6 +67,9 @@ disksync.exe --restore F:\C C:\Restored
 
 - `F:\C` is the backup folder from step 2.
 - `C:\Restored` is where your files will go. It's created if needed and must be on the clean PC.
+- If it says the folder **has no `_hashes.tsv`** (the backup was stopped before it finished),
+  add `--no-hashes` to the end. Every check still runs except step 3 below (the fingerprint
+  check), so a file changed on the disk after the backup can't be caught.
 
 If Windows shows **"Windows protected your PC"**, click **More info → Run anyway**. The exe
 isn't code-signed.
